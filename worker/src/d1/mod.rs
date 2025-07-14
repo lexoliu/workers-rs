@@ -1,13 +1,21 @@
+use core::future::Future;
+use core::future::IntoFuture;
+use core::task::Poll;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::iter::{once, Once};
 use std::ops::Deref;
 use std::result::Result as StdResult;
 
+use futures_util::ready;
+use futures_util::FutureExt;
+use futures_util::TryFutureExt;
 use js_sys::Array;
 use js_sys::ArrayBuffer;
 use js_sys::JsString;
+use js_sys::Promise;
 use js_sys::Uint8Array;
+use pin_project::pin_project;
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -219,8 +227,56 @@ impl D1Argument for D1PreparedArgument<'_> {
     }
 }
 
+impl IntoFuture for D1PreparedStatement {
+    type Output = Result<D1Result>;
+    type IntoFuture = D1PreparedStatementFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        D1PreparedStatementFuture {
+            inner: D1PreparedStatementFutureInner::Statement(self.0),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct D1PreparedStatementFuture {
+    inner: D1PreparedStatementFutureInner,
+}
+
+impl Future for D1PreparedStatementFuture {
+    type Output = Result<D1Result>;
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        match &mut self.inner {
+            D1PreparedStatementFutureInner::Statement(stmt) => match stmt.run() {
+                Ok(promise) => {
+                    let js_future = JsFuture::from(promise);
+                    self.inner = D1PreparedStatementFutureInner::JsFuture(js_future);
+                    Poll::Pending
+                }
+                Err(error) => Poll::Ready(Err(Error::from(error))),
+            },
+            D1PreparedStatementFutureInner::JsFuture(js_future) => {
+                let result = ready!(js_future.poll_unpin(cx));
+                let result = cast_to_d1_error(result);
+                Poll::Ready(result.map(|value| D1Result(value.into())))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum D1PreparedStatementFutureInner {
+    Statement(D1PreparedStatementSys),
+    JsFuture(JsFuture),
+}
+
 // A D1 prepared query statement.
 #[derive(Clone)]
+#[must_use]
 pub struct D1PreparedStatement(D1PreparedStatementSys);
 
 impl D1PreparedStatement {
